@@ -5,6 +5,8 @@ import concurrent.futures
 import multiprocessing
 import multiprocessing.context
 import os
+import signal
+import sys
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import contextmanager
@@ -207,6 +209,113 @@ async def test_worker_cancel_run(client: Client):
     with pytest.raises(asyncio.CancelledError):
         await run_task
     assert not worker.is_running and worker.is_shutdown
+
+
+async def test_worker_run_signal_shutdown_default_unchanged(client: Client):
+    # Default (no signal_shutdown) must behave exactly as before: shutdown is
+    # only triggered by an explicit shutdown() call.
+    worker = create_worker(client)
+    run_task = asyncio.create_task(worker.run())
+    await asyncio.sleep(0.3)
+    assert worker.is_running and not worker.is_shutdown
+    await worker.shutdown()
+    await run_task
+    assert not worker.is_running and worker.is_shutdown
+
+
+async def test_worker_run_signal_shutdown_empty_is_noop(client: Client):
+    # Passing an empty sequence is equivalent to the default — no handlers
+    # installed, behavior identical to plain run().
+    worker = create_worker(client)
+    _ = asyncio.get_running_loop()
+    original_handler = signal.getsignal(signal.SIGUSR1) if sys.platform != "win32" else None
+    run_task = asyncio.create_task(worker.run(signal_shutdown=[]))
+    await asyncio.sleep(0.3)
+    assert worker.is_running
+    if sys.platform != "win32":
+        assert signal.getsignal(signal.SIGUSR1) is original_handler
+    await worker.shutdown()
+    await run_task
+    assert worker.is_shutdown
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only signal")
+async def test_worker_run_signal_shutdown_triggers_shutdown(client: Client):
+    # Sending one of the configured signals must initiate the same graceful
+    # shutdown path as worker.shutdown() — run() should return cleanly.
+    worker = create_worker(client)
+    run_task = asyncio.create_task(worker.run(signal_shutdown=[signal.SIGUSR1]))
+    await asyncio.sleep(0.3)
+    assert worker.is_running and not worker.is_shutdown
+    os.kill(os.getpid(), signal.SIGUSR1)
+    await asyncio.wait_for(run_task, timeout=10)
+    assert not worker.is_running and worker.is_shutdown
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only signals")
+async def test_worker_run_signal_shutdown_multiple_signals(client: Client):
+    # When multiple signals are registered, any one of them should trigger
+    # shutdown. Verifies the loop iterates all entries (not just the first).
+    worker = create_worker(client)
+    run_task = asyncio.create_task(
+        worker.run(signal_shutdown=[signal.SIGUSR1, signal.SIGUSR2])
+    )
+    await asyncio.sleep(0.3)
+    assert worker.is_running
+    os.kill(os.getpid(), signal.SIGUSR2)
+    await asyncio.wait_for(run_task, timeout=10)
+    assert worker.is_shutdown
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only signal")
+async def test_worker_run_signal_handlers_removed_after_run(client: Client):
+    # After run() returns, signal handlers must be uninstalled so subsequent
+    # signals don't fire stale callbacks at an already-shutdown worker.
+    worker = create_worker(client)
+    loop = asyncio.get_running_loop()
+
+    run_task = asyncio.create_task(worker.run(signal_shutdown=[signal.SIGUSR1]))
+    await asyncio.sleep(0.3)
+    # Handler is installed while run() is active. remove_signal_handler returns
+    # True if a handler was registered, False otherwise.
+    assert loop.remove_signal_handler(signal.SIGUSR1) is True
+    # Shutdown via the event directly — signal handler is gone but the
+    # shutdown path doesn't depend on it.
+    await worker.shutdown()
+    await run_task
+    # After run() exits, removing again should report "nothing was registered".
+    assert loop.remove_signal_handler(signal.SIGUSR1) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only signal")
+async def test_worker_run_signal_shutdown_explicit_shutdown_still_works(
+    client: Client,
+):
+    # Even with signal_shutdown registered, an explicit worker.shutdown() call
+    # must still cleanly stop the worker (signal path is additive, not a
+    # replacement).
+    worker = create_worker(client)
+    run_task = asyncio.create_task(worker.run(signal_shutdown=[signal.SIGUSR1]))
+    await asyncio.sleep(0.3)
+    assert worker.is_running
+    await worker.shutdown()
+    await run_task
+    assert worker.is_shutdown
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only signal")
+async def test_worker_run_signal_handlers_removed_on_fatal_error(client: Client):
+    # Signal handlers must also be uninstalled when run() exits via a fatal
+    # worker error (not just clean shutdown) — the contextmanager's finally
+    # block is responsible for this.
+    worker = create_worker(client)
+    loop = asyncio.get_running_loop()
+    with pytest.raises(RuntimeError):
+        with WorkerFailureInjector(worker) as inj:
+            inj.workflow.poll_fail_queue.put_nowait(RuntimeError("OH NO"))
+            await worker.run(signal_shutdown=[signal.SIGUSR1])
+    # Handler should be gone now that run() has unwound.
+    assert loop.remove_signal_handler(signal.SIGUSR1) is False
 
 
 @activity.defn
